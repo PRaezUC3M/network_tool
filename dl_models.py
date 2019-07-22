@@ -1,5 +1,5 @@
 # This module is used specifically for dl purposes.
-from utils import *
+from Utils.utils import *
 
 import keras
 from keras import backend as K
@@ -13,10 +13,15 @@ from keras.callbacks import ReduceLROnPlateau, EarlyStopping, ModelCheckpoint, T
 from keras.losses import binary_crossentropy
 from keras.optimizers import RMSprop, Adam
 
+from gensim.models.keyedvectors import KeyedVectors
+
+import numpy as np
+import sys
+
 import itertools
 
 class ModelExperiments():
-    def __init__(self, network_parameters, indexes, retrain_models=False, model_dir="./models"):
+    def __init__(self, network_parameters, indexes, model_dir="./models/"):
         """ 
         This class is the one in charge of getting the set of configurations for the experiments, generating the different
         possible model configurations, compile and train the different models.
@@ -27,7 +32,6 @@ class ModelExperiments():
         self.model_list = []
         self.experiment_names = []
         self.model_callbacks = []
-        self.retrain_models = retrain_models
         
         self.model_dir = model_dir
         check_dir(self.model_dir)
@@ -59,53 +63,62 @@ class ModelExperiments():
         
         return self.model_list, self.experiment_names
             
-    def train_models(x, y):
+    def train_models(self, x, y, validation=None, retrain_models=False):
         """
         This method trains all the compiled models of the experiments. It receives as input the training and validation data,
-        othersi
+        otherwise.
         """
         for i, net_model in enumerate(self.model_list):
             # Set a name for the model based on the tweaked parameters
             p = self.network_parameters[i]
             name = self.experiment_names[i]
-            model_path = self.models_dir + name
+            model_path = self.model_dir + name
 
-            if not self.retrain_models:
+            if not retrain_models:
                 # If the model exists, don't compute it again.
                 if os.path.isfile(model_path):
                     continue
 
             print("\n\n********************************************\n")    
             print(name)
-            callbacks = self._create_callbacks(name)
+            callbacks = self._create_callbacks(name, i)
             # Fit the model and extract its data
+            print("Callbacks are the following")
+            print(callbacks)
             try:
-                history = net_model.fit(train_x_token, train_y,
+                history = net_model.fit(x, y,
+                                        # Uses the 25% of the train as validation. This validation can be parametrizable too.
                                         validation_split=0.25,
-                                        epochs=20, 
-                                        batch_size=network_parameters[i]["batch_size"], 
+                                        # Even with early-stopping this could be good to parameterize. 
+                                        epochs=self.network_parameters[i].get("epochs", 20),                        
+                                        batch_size=self.network_parameters[i].get("batch_size", None),
                                         callbacks=callbacks,
-                                        class_weight={0: 0.11, 1: 0.89} # Classes are weighted proportionally.
+                                        # This will ponderate the classes. Use with unbalanced datasets.
+                                        # Adding it as a parameter might be a good idea.
+                                        #class_weight={0: 0.11, 1: 0.89} 
                                        )
             except Exception as e:
                 print("Could not Train Model")
-                print(Exception)
+                print(e)
                 continue
 
-            # And save the model
-            net_model.save(model_path)
 
         # To free memory from the gpu
+        # This is used for long collections of experiments.
         from keras import backend as K
         K.clear_session()
 
         
-    def _create_callbacks(self, name):
+    def _create_callbacks(self, name, i):
         """
         This function generates the callback for each training of the network. TensorBoard is also included
         in these callbacks.
         
         The tensorboard logs will be stored in a folder with the configuration of the experiment as name.
+        
+        parameters:
+            name: the name of the training for the logs of the tensorboard.
+            i: The position of the experiment in the posible configurations.
         """
         # Directory where the tensorboard will be stored.
         log_dir = self.model_dir + 'logs/' + name
@@ -116,11 +129,12 @@ class ModelExperiments():
 
         # Generate the dir if it does not exist.
         check_dir(log_dir)
+        patience = self.network_parameters[i].get("patience", 4)
         
         # Collection of callbacks for that experiment.
         callbacks = [
-            ReduceLROnPlateau(patience=2),# Can change the patience used. Maybe add as parameter.
-            EarlyStopping(patience=4),    # Can change the patience used. Maybe add as parameter.
+            ReduceLROnPlateau(patience=patience/2),
+            EarlyStopping(patience=patience), 
             tensorboard
         ]
         
@@ -179,28 +193,20 @@ class ExperimentsGenerator():
                 name += "{}_{}_".format(k, v)
             else:
                 name = name[:-1]
-                
-            name = name.replace(" ", "").replace("[", "").replace("]", "").replace(",", "-").split(".")[-1].replace("'", "").replace(">", "")
+
+             # This is used to clean the names of possible keras classes as well as punctuations.    
+            name = name.replace(" ", "").replace("[", "").replace("]", "").replace(",", "-").replace("'", "").replace(">", "").replace("<classkeras.layers.recurrent.", "")
             
             network_names.append(name)
-    
+            
         return network_names
     
-        """
-        network_names = []
-        for i, p in enumerate(network_parameters):
-            name = "load_emb_{}_num_classes_{}_emb_size_{}_trainable_emb_{}_cnn_size_{}_cnn_filter_{}_pool_rnn_size_{}_cell_type_{}_bidirectional_{}_attention_{}_dropout_{}_dnn_size_{}_batch_size_{}".format(
-              p["load_emb"], p["num_classes"], p["emb_size"], p["trainable_emb"], p["cnn_size"], p["cnn_filter"],
-              p["rnn_size"], str(p["cell_type"]).split(".")[-1].replace("'", "").replace(">", ""), p["bidirectional"],
-              p["attention"], p["dropout"], p["dnn_size"], p["batch_size"])
-            
-            name = name.replace(" ", "").replace("[", "").replace("]", "").replace(",", "-")
-            self.experiment_names.append(name)
-    
-        return self.experiment_names
-        """
     
 class ModelGenerator():
+    # This will be used as a class attribute. Because loading embeddings is a really costly process but we want this 
+    # class to be a factory of models we cant have normal class methods.
+    w2v_model = None
+    
     def __init__(self):
         """
         # This class will generate the different models depending on the configuration of the experimets passed.
@@ -208,31 +214,35 @@ class ModelGenerator():
         """
         pass
     
-    def create_model(self, params):
+    @classmethod
+    def create_model(cls, params):
         """
         This method creates a network model with the parameters given.
 
         Returns the uncompiled model.
         """
+        
         inputs = Input(name='inputs',shape=(params["input_length"],))
 
-        z = self._add_embeddings(inputs, params["load_emb"], params["emb_size"], params["trainable_emb"],
-                                 params["vocabulary_length"] ,params["input_length"], params["embedding_matrix"])
+        z = cls._add_embeddings(inputs, params)
 
-        z = self._add_cnn(z, params["cnn_size"], params["cnn_filter"], [None] == params["rnn_size"])
+        z = cls._add_cnn(z, params)
 
-        z = self._add_rnn(z, params["rnn_size"], params["bidirectional"], params["cell_type"], params["attention"])
+        z = cls._add_rnn(z, params)
 
-        z = self._add_dnn(z, params["dnn_size"], params["dropout"])
+        z = cls._add_dnn(z, params)
 
-        outputs = Dense(params["num_classes"], activation='sigmoid', name='output_layer')(z)
+        # This layer uses a sigmoidal activation for 1 class or a softmax in case of a multi-classification problem.
+        outputs = Dense(params.get("output_length", 1),
+                        activation='sigmoid' if params.get("output_length") == 1 else 'softmax',
+                        name='output_layer')(z)
 
         net_model = Model(inputs=inputs,outputs=outputs)
 
         return net_model
     
-    @staticmethod
-    def _add_embeddings(z, load, size, trainable, vocab_size, input_length, embedding_matrix=None): 
+    @classmethod
+    def _add_embeddings(cls, z, params): 
         """
         This method adds embeddings to the network.
 
@@ -240,22 +250,37 @@ class ModelGenerator():
 
         Parameters:
             z: The model up to now.
-            load: Defines if the embeddings are going to be loaded.
-            size: Defines the size of the embedding vector. Must match size if the embeddings are loaded.
-            trainable: Defines if the embeddings can be trainable. Set to True if load is false.
-            vocab_size: Defines the size of the vocabulary.
-            input_length: Defines the length of the sequences it gets as input.
-            embedding_matrix: Defines the weights used in case of load==true.
+            parameters: These are the dictionary of parameters of the network. This may contain the following ones:
+                load: Defines if the embeddings are going to be loaded. Defaults to False.
+                size: Defines the size of the embedding vector. Must match size if the embeddings are loaded. Defaults to 300.
+                trainable: Defines if the embeddings can be trainable. Defaults to the oposite of load.
+                vocab_size: Defines the size of the vocabulary. Defaults to 5000.
+                input_length: Defines the length of the sequences it gets as input. Must be defined.
+                embedding_matrix: Defines the weights used if loading the embeddings.
         """
+        # Get the parameters needed for the embeddings
+        load = params.get('load_emb', False)
+        size = params.get('emb_size', 300)
+        trainable = params.get('trainable', not load) # If not loading, default is to train the embeddings
+        vocab_size = params.get('vocabulary_length', 5000)
+        input_length = params.get('input_length')
+        embedding_matrix = params.get('embedding_matrix', None)
+        
+                
         if load:
+            if embedding_matrix is None:
+                print("No embeddings matrix added as a parameter. Using Randomly initialized one instead")
+                load = False
+        
+        if load:    
             z = Embedding(vocab_size, size, input_length=input_length, weights=[embedding_matrix], trainable=trainable)(z)
         else:
             z = Embedding(vocab_size, size, input_length=input_length)(z)
 
         return z
 
-    @staticmethod
-    def _add_cnn(z, size, filter_sizes, flatten):
+    @classmethod
+    def _add_cnn(cls, z, params):
         """
         This method adds the unidimensional CNN layers to the network. After each cnn, a MaxPooling is applied.
 
@@ -263,11 +288,16 @@ class ModelGenerator():
 
         Parameters:
             z: The model up to now.
-            size: The vector of sizes of the desired cnn. 
-            filter_sizes: The vector of sizes of the desired filters. Multiple filters can be applied at the same time. This will
-            generate diverse branches (one per filter size) which will concatenate after the convolutions.
-            flatten: Defines if the output data must be flattened or not.
+            parameters: These are the dictionary of parameters of the network. This may contain the following ones:
+                size: Defines the number of filters and the number of layers.
+                filter_sizes: Defines the size of the filters used, as well as the number of them.
+                flatten: Defines if a flatten layer is added at the end of the cnn ones.
         """
+        # Get the parameters needed for the cnns
+        size = params.get("cnn_size", None)
+        filter_sizes = params.get("cnn_filter", 3)
+        flatten = [None] == params.get("rnn_size", [None])  # This can be changed if the topology (cnn followed by rnn) changes.        
+            
         conv_blocks = []
         for filter_size in filter_sizes:
             if filter_size is None:
@@ -287,8 +317,8 @@ class ModelGenerator():
 
         return z
 
-    @staticmethod
-    def _add_rnn(z, size, bidirectional, cell_type, attention):
+    @classmethod
+    def _add_rnn(cls, z, params):
         """
         This method adds the RNN layers to the network. It also adds an attention layer if intended.
 
@@ -296,11 +326,18 @@ class ModelGenerator():
 
         parameters:
             z: The model up to now.
-            size: The vector of sizes of the desired rnn. 
-            bidirectional: Defines if the rnn layers are bidirectional ones. This will affect to all layers, so caution is advised.
-            cell_type: Defines the type of the recurrent cell used (GRU OR LSTM)
-            attention: Defines if attention is used as a pooling method.
+            params: These are the dictionary of parameters of the network. This may contain the following ones:
+                size: The vector of sizes of the desired rnn. 
+                bidirectional: Defines if the rnn layers are bidirectional ones. This will affect to all layers, so caution is advised.
+                cell_type: Defines the type of the recurrent cell used (GRU OR LSTM)
+                attention: Defines if attention is used as a pooling method.
         """
+        # Get the parameters needed for the RNNs
+        size = params.get("rnn_size", None)
+        bidirectional = params.get("bidirectional", False)
+        cell_type = params.get("cell_type", GRU)
+        attention = params.get("attention", False)
+        
         for i, rsz in enumerate(size):
             if rsz is None:
                 return z
@@ -318,12 +355,12 @@ class ModelGenerator():
                     z = Bidirectional(cell_type(rsz, return_sequences=attention))(z)
 
             if attention:
-                z = _add_attention(z)
+                z = cls._add_attention(z)
 
         return z
 
-    @staticmethod
-    def _add_dnn(z, size, dropout, activation="relu"):
+    @classmethod
+    def _add_dnn(cls, z, params):
         """
         This method adds the DNN layers to the network.
 
@@ -331,10 +368,15 @@ class ModelGenerator():
 
         parameters:
             z: The model up to now.
-            size: The vector of sizes of the desired dnn.
-            dropout: The dropout used.
-            activation: The activation of the cells. Set to relu.
+            params: These are the dictionary of parameters of the network. This may contain the following ones:
+                size: The vector of sizes of the desired dnn.
+                dropout: The dropout used.
+                activation: The activation of the cells. Set to relu.
         """
+        
+        size = params.get("dnn_size", None)
+        dropout = params.get("dropout", 0.5)
+        activation= params.get("activation", "relu")
         for fsz in size:
             if fsz is None:
                 return z
@@ -344,8 +386,8 @@ class ModelGenerator():
 
         return z
 
-    @staticmethod
-    def _add_attention(z):
+    @classmethod
+    def _add_attention(cls, z):
         """
         This method applies an attention layer to the rnns.
 
@@ -364,3 +406,32 @@ class ModelGenerator():
         z = Lambda(lambda xin: K.sum(xin, axis=-2), output_shape=(size,))(z)
 
         return z
+    
+    @staticmethod
+    def load_W2V_model(path, binary):
+        """
+        This function is used to load a w2v model into the class.
+        
+        This function is only needed if parameters of loading embeddings are set to true.
+        """
+        model = KeyedVectors.load_word2vec_format(path, binary=binary)
+        print("Loaded W2V model")
+        
+        return model
+    
+    @staticmethod
+    def generate_embedding_matrix(word_index, max_words, model):
+        # We initialize the embd matrix as random
+        # embedding_matrix = np.zeros((max_words, model.vector_size), dtype=np.float32)
+        embedding_matrix = np.random.rand(max_words, model.vector_size)
+        hit = 0
+        for word, i in word_index.items():
+            if i >= max_words:
+                break
+            if word in model:
+                # words not found in embedding index will be randomly initialized.
+                embedding_matrix[i] = model[word]
+                hit += 1
+        print("Hits: {}\nTotal: {}".format(hit, i))
+
+        return embedding_matrix
